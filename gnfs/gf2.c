@@ -285,13 +285,35 @@ static uint32 fill_qcb(msieve_obj *obj, mpz_poly_t *apoly,
 
 /*------------------------------------------------------------------*/
 static uint32 combine_relations(la_col_t *col, relation_t *rlist,
-				ideal_t *merged_ideals, uint32 *dense_rows,
+				ideal_t **merged_ideals_out,
+				uint32 *dense_rows,
 				uint32 num_dense_rows, uint32 qcb_size) {
 
 	uint32 i, j, k;
 	uint32 num_merged = 0;
-	ideal_t tmp_ideals[MAX_COL_IDEALS];
+	size_t max_ideals = 0;
+	ideal_t *work_a;
+	ideal_t *work_b;
+	ideal_t *current;
+	ideal_t *next;
 	uint32 num_tmp_ideals;
+
+	for (i = 0; i < col->cycle.num_relations; i++) {
+		relation_t *r = rlist + col->cycle.list[i];
+		size_t count = (size_t)r->num_factors_r + r->num_factors_a;
+
+		if (count > SIZE_MAX - max_ideals) {
+			printf("error: cycle ideal count overflow\n");
+			exit(-1);
+		}
+		max_ideals += count;
+	}
+	if (max_ideals == 0)
+		max_ideals = 1;
+	work_a = (ideal_t *)xmalloc(max_ideals * sizeof(ideal_t));
+	work_b = (ideal_t *)xmalloc(max_ideals * sizeof(ideal_t));
+	current = work_a;
+	next = work_b;
 
 	/* form the matrix column corresponding to a 
 	   collection of relations */
@@ -319,10 +341,6 @@ static uint32 combine_relations(la_col_t *col, relation_t *rlist,
 			printf("error: overflow reading ideals\n");
 			exit(-1);
 		}
-		if (num_merged + new_ideals.ideal_count >= MAX_COL_IDEALS) {
-			printf("error: overflow merging ideals\n");
-			exit(-1);
-		}
 		if (new_ideals.ideal_count > 1) {
 			qsort(new_ideals.ideal_list, 
 					(size_t)new_ideals.ideal_count,
@@ -335,14 +353,13 @@ static uint32 combine_relations(la_col_t *col, relation_t *rlist,
 		num_tmp_ideals = 0;
 		while (j < num_merged && k < new_ideals.ideal_count) {
 			int32 compare_result = compare_ideals(
-						merged_ideals + j,
+						current + j,
 						new_ideals.ideal_list + k);
 			if (compare_result < 0) {
-				tmp_ideals[num_tmp_ideals++] = 
-						merged_ideals[j++];
+				next[num_tmp_ideals++] = current[j++];
 			}
 			else if (compare_result > 0) {
-				tmp_ideals[num_tmp_ideals++] = 
+				next[num_tmp_ideals++] =
 						new_ideals.ideal_list[k++];
 			}
 			else {
@@ -350,17 +367,23 @@ static uint32 combine_relations(la_col_t *col, relation_t *rlist,
 			}
 		}
 		while (j < num_merged) {
-			tmp_ideals[num_tmp_ideals++] = merged_ideals[j++];
+			next[num_tmp_ideals++] = current[j++];
 		}
 		while (k < new_ideals.ideal_count) {
-			tmp_ideals[num_tmp_ideals++] = 
+			next[num_tmp_ideals++] =
 						new_ideals.ideal_list[k++];
 		}
 
 		num_merged = num_tmp_ideals;
-		memcpy(merged_ideals, tmp_ideals, 
-				num_merged * sizeof(ideal_t));
+		{
+			ideal_t *tmp = current;
+			current = next;
+			next = tmp;
+		}
 	}
+
+	free(next);
+	*merged_ideals_out = current;
 
 	/* fill in the parity row, and place at dense 
 	   row position qcb_size */
@@ -409,8 +432,8 @@ static void build_matrix_core(msieve_obj *obj, la_col_t *cycle_list,
 
 	for (i = 0; i < num_cycles; i++) {
 		la_col_t *c = cycle_list + i;
-		ideal_t merged_ideals[MAX_COL_IDEALS];
-		uint32 mapped_ideals[MAX_COL_IDEALS];
+		ideal_t *merged_ideals;
+		uint32 *mapped_ideals;
 		uint32 num_merged;
 
 		/* dense rows start off empty */
@@ -421,9 +444,11 @@ static void build_matrix_core(msieve_obj *obj, la_col_t *cycle_list,
 		/* merge the relations and quadratic characters
 		   in the cycle */
 
-		num_merged = combine_relations(c, rlist, merged_ideals, 
+		num_merged = combine_relations(c, rlist, &merged_ideals,
 						dense_rows, num_dense_rows,
 						qcb_size);
+		mapped_ideals = (uint32 *)xmalloc(
+					MAX(num_merged, 1) * sizeof(uint32));
 
 		/* assign a unique number to each ideal in 
 		   the cycle. This will automatically ignore
@@ -464,6 +489,8 @@ static void build_matrix_core(msieve_obj *obj, la_col_t *cycle_list,
 		fwrite(mapped_ideals, sizeof(uint32), (size_t)k, matrix_fp);
 		fwrite(dense_rows, sizeof(uint32), 
 				(size_t)dense_row_words, matrix_fp);
+		free(mapped_ideals);
+		free(merged_ideals);
 	}
 
 	/* save the matrix dimensions to disk */

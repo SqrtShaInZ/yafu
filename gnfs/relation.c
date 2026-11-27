@@ -14,6 +14,10 @@ $Id: relation.c 1025 2018-08-19 02:20:28Z jasonp_sf $
 
 #include <ms_common.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "gnfs.h"
 #include "savefile.h"
 
@@ -152,12 +156,14 @@ int32 nfs_read_relation(char *buf, factor_base_t *fb,
 
 		num_roots = poly_get_zeros(roots, apoly,
 						(uint32)p, &high_coeff, 0);
-		if (num_roots != apoly->degree || high_coeff == 0)
+		if (num_roots + (high_coeff == 0) != apoly->degree)
 		{
-			printf("error -4: num_roots != apoly->degree || high_coeff == 0 (%u, %u, %u)\n", 
+			printf("error -4: invalid free relation roots (%u, %u, %u)\n",
 				num_roots, apoly->degree, high_coeff);
 			return -4;
 		}
+		if (high_coeff == 0)
+			roots[num_roots++] = (uint32)p;
 		for (i = 0; i < num_roots; i++) {
 			array_size = compress_p(factors, (uint64)roots[i], 
 						array_size);
@@ -551,6 +557,280 @@ static int compare_uint32(const void *x, const void *y) {
 }
 
 typedef struct {
+	int64 a;
+	uint64 b;
+	uint32 purge_idx;
+	uint32 list_idx;
+	uint32 found;
+} cado_source_entry_t;
+
+static size_t hash_relation_coord(int64 a, uint64 b, size_t capacity) {
+	uint64 x = ((uint64)a) ^ (b + UINT64_C(0x9e3779b97f4a7c15));
+	x ^= x >> 30;
+	x *= UINT64_C(0xbf58476d1ce4e5b9);
+	x ^= x >> 27;
+	x *= UINT64_C(0x94d049bb133111eb);
+	x ^= x >> 31;
+	return (size_t)(x & (capacity - 1));
+}
+
+static int parse_cado_purge_coord(char *line, int64 *a, uint64 *b) {
+	char *comma;
+	char *colon;
+
+	errno = 0;
+	*a = strtoll(line, &comma, 16);
+	if (errno || comma == line || comma[0] != ',')
+		return 0;
+
+	errno = 0;
+	*b = strtoull(comma + 1, &colon, 16);
+	return !errno && colon != comma + 1 && colon[0] == ':';
+}
+
+static int parse_cado_source_coord(char *line, int base,
+					int64 *a, uint64 *b, char **colon) {
+	char *comma;
+	char *end;
+
+	errno = 0;
+	*a = strtoll(line, &comma, base);
+	if (errno || comma == line || comma[0] != ',')
+		return 0;
+
+	errno = 0;
+	*b = strtoull(comma + 1, &end, base);
+	if (errno || end == comma + 1 || end[0] != ':')
+		return 0;
+
+	*colon = end;
+	return 1;
+}
+
+static void nfs_scan_cado_source_file(msieve_obj *obj, factor_base_t *fb,
+				const char *filename, int coord_base,
+				cado_source_entry_t *entries,
+				size_t capacity, relation_t *rlist,
+				uint32 compress, uint8 *tmp_factors,
+				uint32 *factor_size,
+				relation_t *tmp_relation, mpz_t scratch) {
+	char line[8192];
+	char normalized[8192];
+	FILE *fp = fopen(filename, "rb");
+
+	if (fp == NULL) {
+		logprintf(obj, "error: cannot open CADO relation source %s\n",
+				filename);
+		exit(-1);
+	}
+
+	tmp_relation->factors = tmp_factors;
+	while (fgets(line, sizeof(line), fp) != NULL) {
+		char *colon;
+		int64 a;
+		uint64 b;
+		size_t slot;
+		int32 status;
+
+		if (!parse_cado_source_coord(line, coord_base, &a, &b, &colon))
+			continue;
+
+		slot = hash_relation_coord(a, b, capacity);
+		while (entries[slot].purge_idx != UINT32_MAX) {
+			cado_source_entry_t *entry = entries + slot;
+			if (entry->a == a && entry->b == b)
+				break;
+			slot = (slot + 1) & (capacity - 1);
+		}
+		if (entries[slot].purge_idx == UINT32_MAX ||
+		    entries[slot].found)
+			continue;
+
+		if (coord_base == 16) {
+			int n = snprintf(normalized, sizeof(normalized),
+					"%" PRId64 ",0%s", a, colon);
+			if (n < 0 || (size_t)n >= sizeof(normalized)) {
+				logprintf(obj, "error: CADO free relation too long\n");
+				exit(-1);
+			}
+		}
+		else {
+			size_t len = strlen(line);
+			if (len >= sizeof(normalized)) {
+				logprintf(obj, "error: CADO relation too long\n");
+				exit(-1);
+			}
+			memcpy(normalized, line, len + 1);
+		}
+
+		status = nfs_read_relation(normalized, fb, tmp_relation,
+						factor_size, compress, scratch, 0);
+		if (status) {
+			logprintf(obj,
+				"error: cannot parse CADO source relation %s "
+				"(purge row %u, status %d)\n",
+				filename, entries[slot].purge_idx, status);
+			exit(-1);
+		}
+
+		{
+			cado_source_entry_t *entry = entries + slot;
+			relation_t *r = rlist + entry->list_idx;
+
+			*r = *tmp_relation;
+			r->rel_index = entry->purge_idx;
+			r->factors = (uint8 *)xmalloc(
+						*factor_size * sizeof(uint8));
+			memcpy(r->factors, tmp_factors,
+						*factor_size * sizeof(uint8));
+			entry->found = 1;
+		}
+	}
+
+	fclose(fp);
+}
+
+static void nfs_read_cado_source_relations(msieve_obj *obj,
+				factor_base_t *fb,
+				uint32 num_unique_relidx,
+				uint32 *relidx_list,
+				relation_t *rlist,
+				uint32 compress,
+				uint8 *tmp_factors,
+				uint32 *factor_size,
+				relation_t *tmp_relation,
+				mpz_t scratch) {
+	char purgefile[LINE_BUF_SIZE * 4];
+	char upload_dir[LINE_BUF_SIZE * 4];
+	char filename[LINE_BUF_SIZE * 4];
+	char line[8192];
+	FILE *fp;
+	DIR *dir;
+	struct dirent *entry;
+	cado_source_entry_t *entries;
+	size_t capacity = 1;
+	uint32 purge_idx = 0;
+	uint32 list_idx = 0;
+	uint32 i;
+
+	while (capacity < (size_t)num_unique_relidx * 2)
+		capacity <<= 1;
+	entries = (cado_source_entry_t *)xmalloc(
+					capacity * sizeof(cado_source_entry_t));
+	for (i = 0; i < capacity; i++) {
+		entries[i].purge_idx = UINT32_MAX;
+		entries[i].found = 0;
+	}
+
+	if (snprintf(purgefile, sizeof(purgefile), "%s.purged",
+			obj->savefile.name) >= (int)sizeof(purgefile) ||
+	    snprintf(upload_dir, sizeof(upload_dir), "%s.upload",
+			obj->savefile.name) >= (int)sizeof(upload_dir)) {
+		logprintf(obj, "error: CADO relation path is too long\n");
+		exit(-1);
+	}
+
+	fp = fopen(purgefile, "rb");
+	if (fp == NULL || fgets(line, sizeof(line), fp) == NULL) {
+		logprintf(obj, "error: cannot read CADO purge file %s\n",
+				purgefile);
+		exit(-1);
+	}
+	while (list_idx < num_unique_relidx && fgets(line, sizeof(line), fp)) {
+		int64 a;
+		uint64 b;
+		size_t slot;
+
+		if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+			continue;
+		if (purge_idx == relidx_list[list_idx]) {
+			if (!parse_cado_purge_coord(line, &a, &b)) {
+				logprintf(obj,
+					"error: corrupt CADO purge row %u: %s\n",
+					purge_idx, line);
+				exit(-1);
+			}
+			slot = hash_relation_coord(a, b, capacity);
+			while (entries[slot].purge_idx != UINT32_MAX) {
+				if (entries[slot].a == a && entries[slot].b == b)
+					break;
+				slot = (slot + 1) & (capacity - 1);
+			}
+			entries[slot].a = a;
+			entries[slot].b = b;
+			entries[slot].purge_idx = purge_idx;
+			entries[slot].list_idx = list_idx;
+			rlist[list_idx].rel_index = purge_idx;
+			list_idx++;
+		}
+		purge_idx++;
+	}
+	fclose(fp);
+
+	if (list_idx != num_unique_relidx) {
+		logprintf(obj,
+			"error: CADO purge file has no relation %u\n",
+			relidx_list[list_idx]);
+		exit(-1);
+	}
+
+	if (snprintf(filename, sizeof(filename), "%s.freerel",
+			obj->savefile.name) >= (int)sizeof(filename)) {
+		logprintf(obj, "error: CADO free-relation path is too long\n");
+		exit(-1);
+	}
+	nfs_scan_cado_source_file(obj, fb, filename, 16,
+				entries, capacity, rlist,
+				compress, tmp_factors, factor_size,
+				tmp_relation, scratch);
+
+	dir = opendir(upload_dir);
+	if (dir == NULL) {
+		logprintf(obj, "error: cannot open CADO upload directory %s\n",
+				upload_dir);
+		exit(-1);
+	}
+	while ((entry = readdir(dir)) != NULL) {
+		struct stat st;
+
+		if (entry->d_name[0] == '.')
+			continue;
+		if (snprintf(filename, sizeof(filename), "%s/%s",
+				upload_dir, entry->d_name) >=
+						(int)sizeof(filename)) {
+			logprintf(obj, "error: CADO upload path is too long\n");
+			exit(-1);
+		}
+		if (stat(filename, &st) != 0 || !S_ISREG(st.st_mode))
+			continue;
+		nfs_scan_cado_source_file(obj, fb, filename, 10,
+					entries, capacity,
+					rlist, compress, tmp_factors,
+					factor_size, tmp_relation, scratch);
+	}
+	closedir(dir);
+
+	for (i = 0; i < num_unique_relidx; i++) {
+		int64 a = rlist[i].a;
+		uint64 b = rlist[i].b;
+		size_t slot = hash_relation_coord(a, b, capacity);
+
+		while (entries[slot].purge_idx != UINT32_MAX &&
+		       (entries[slot].a != a || entries[slot].b != b))
+			slot = (slot + 1) & (capacity - 1);
+		if (entries[slot].purge_idx == UINT32_MAX ||
+		    !entries[slot].found) {
+			logprintf(obj,
+				"error: cannot locate CADO source relation "
+				"for purge row %u\n", relidx_list[i]);
+			exit(-1);
+		}
+	}
+
+	free(entries);
+}
+
+typedef struct {
 	uint32 relidx;
 	uint32 count;
 } relcount_t;
@@ -639,6 +919,22 @@ static void nfs_get_cycle_relations(msieve_obj *obj,
 	j = 0;
 	savefile_read_line(buf, sizeof(buf), savefile);
 	mpz_init(scratch);
+
+	if (buf[0] == '#' &&
+	    sscanf(buf, "# %u %*u %*u", &i) == 1) {
+		savefile_close(savefile);
+		nfs_read_cado_source_relations(obj, fb, num_unique_relidx,
+					relidx_list, rlist, compress,
+					tmp_factors, &factor_size,
+					&tmp_relation, scratch);
+		*num_relations_out = num_unique_relidx;
+		logprintf(obj, "read %u relations\n", num_unique_relidx);
+		hashtable_free(&unique_relidx);
+		*rlist_out = rlist;
+		mpz_clear(scratch);
+		return;
+	}
+
 	while (!savefile_eof(savefile) && j < num_unique_relidx) {
 		
 		int32 status;
@@ -791,71 +1087,184 @@ static int bsearch_relconvert(const void *key, const void *t) {
 }
 
 void nfs_convert_cado_cycles(msieve_obj *obj) {
-
 	uint32 i, j;
-
 	char buf[LINE_BUF_SIZE];
 	char purgefile[LINE_BUF_SIZE];
 	savefile_t s;
 	savefile_t *savefile = &s;
-
 	uint32 num_cycles;
 	la_col_t *cycle_list = NULL;
 	uint32 num_unique_relidx;
 	relconvert_t *convert;
 
-	/* read the raw list of relation numbers for each cycle */
+	typedef struct {
+		uint64_t used;
+		int64_t a;
+		uint64_t b;
+		uint32 purge_idx;
+		uint32 save_idx;
+	} cado_ab_entry_t;
+	cado_ab_entry_t *ab_table;
+	size_t ab_capacity;
+	uint32 save_idx;
+
+	/*
+	 * CADO cycle entries are zero-based purge-file row numbers.
+	 * A purged row is CADO hexadecimal format:
+	 *
+	 *     -9356c,2a5:e,62,1fa,...
+	 *
+	 * The fields after ':' are renumber-table ideal indices, but cycle
+	 * entries refer directly to the corresponding zero-based purge rows.
+	 */
+	sprintf(purgefile, "%s.purged", obj->savefile.name);
+
+	{
+		struct stat purge_stat;
+		struct stat save_stat;
+		if (stat(purgefile, &purge_stat) == 0 &&
+		    stat(obj->savefile.name, &save_stat) == 0 &&
+		    purge_stat.st_dev == save_stat.st_dev &&
+		    purge_stat.st_ino == save_stat.st_ino) {
+			/* The cycles already use the relation indices in this savefile. */
+			return;
+		}
+	}
 
 	read_cycles(obj, &num_cycles, &cycle_list, 0, NULL);
 
-	/* for CADO filtering results, the cycle file contains
-	   line numbers in a purge file, not the line numbers of
-	   relations like we want. This is arguably better, since
-	   the purge file results have already assigned unique
-	   numbers to ideals so we could use the purge file to
-	   directly build the matrix. Unfortunately, if we did that
-	   then both the linear algebra and the square root would
-	   need modifications to understand the purge file format.
-	   The alternative is to use the purge file lines to convert 
-	   the purge file line numbers to relation numbers */
-
-	sprintf(purgefile, "%s.purged", obj->savefile.name);
 	savefile_init(savefile, purgefile);
 	savefile_open(savefile, SAVEFILE_READ);
 	savefile_read_line(buf, sizeof(buf), savefile);
 
-	num_unique_relidx = (uint32)strtoul(buf, NULL, 10);
-
-	logprintf(obj, "cycles contain %u unique purge entries\n", 
-				num_unique_relidx);
+	if (sscanf(buf, "# %u %*u %*u", &num_unique_relidx) != 1) {
+		logprintf(obj, "error: cannot read purge file header: %s\n", buf);
+		exit(-1);
+	}
 
 	convert = (relconvert_t *)xmalloc(num_unique_relidx *
 					sizeof(relconvert_t));
 
-	for (i = 0; i < num_unique_relidx; i++) {
+	ab_capacity = 1;
+	while (ab_capacity < (size_t)num_unique_relidx * 2)
+		ab_capacity <<= 1;
+	ab_table = (cado_ab_entry_t *)xcalloc(ab_capacity,
+					sizeof(cado_ab_entry_t));
 
-		relconvert_t *curr = convert + i;
+	for (i = 0; i < num_unique_relidx; i++) {
+		char *comma;
+		char *colon;
+		int64_t a;
+		uint64_t b;
+		size_t slot;
 
 		savefile_read_line(buf, sizeof(buf), savefile);
 
-		/* the relation number is the first entry in the
-		   line from the purge file */
+		if (buf[0] == '\0' || buf[0] == '#') {
+			i--;
+			continue;
+		}
 
-		curr->rel_idx = (uint32)strtoul(buf, NULL, 10);
-		curr->purge_idx = i;
+		errno = 0;
+		a = (int64_t)strtoll(buf, &comma, 16);
+		if (errno || comma == buf || comma[0] != ',') {
+			logprintf(obj, "error: corrupt CADO purge relation: %s\n",
+					buf);
+			exit(-1);
+		}
+		b = (uint64_t)strtoull(comma + 1, &colon, 16);
+		if (errno || colon == comma + 1 || colon[0] != ':') {
+			logprintf(obj, "error: corrupt CADO purge relation: %s\n",
+					buf);
+			exit(-1);
+		}
+
+		{
+			uint64_t x =
+				((uint64_t)a) ^
+				(b + UINT64_C(0x9e3779b97f4a7c15));
+			x ^= x >> 30;
+			x *= UINT64_C(0xbf58476d1ce4e5b9);
+			x ^= x >> 27;
+			x *= UINT64_C(0x94d049bb133111eb);
+			x ^= x >> 31;
+			slot = (size_t)(x & (ab_capacity - 1));
+		}
+		while (ab_table[slot].used) {
+			if (ab_table[slot].a == a && ab_table[slot].b == b)
+				break;
+			slot = (slot + 1) & (ab_capacity - 1);
+		}
+		ab_table[slot].used = 1;
+		ab_table[slot].a = a;
+		ab_table[slot].b = b;
+		ab_table[slot].purge_idx = i;
+		ab_table[slot].save_idx = UINT32_MAX;
+
+		convert[i].purge_idx = i;
+		convert[i].rel_idx = UINT32_MAX;
 	}
 
 	savefile_close(savefile);
 	savefile_free(savefile);
 
-	/* walk through the list of cycles and convert
-	   each purge file number to a relation file number */
+	/* YAFU savefiles use decimal coordinates; CADO purge files use hex. */
+	save_idx = (uint32)(-1);
+	savefile_init(savefile, obj->savefile.name);
+	savefile_open(savefile, SAVEFILE_READ);
+	savefile_read_line(buf, sizeof(buf), savefile);
+
+	while (!savefile_eof(savefile)) {
+		char *comma;
+		char *end;
+		int64_t a;
+		uint64_t b;
+		size_t slot;
+
+		if (buf[0] == '-' || isdigit((unsigned char)buf[0])) {
+			save_idx++;
+			errno = 0;
+			a = (int64_t)strtoll(buf, &comma, 10);
+			if (!errno && comma != buf && comma[0] == ',') {
+				b = (uint64_t)strtoull(comma + 1, &end, 10);
+				if (!errno && end != comma + 1) {
+					slot = hash_relation_coord(a, b,
+								ab_capacity);
+					while (ab_table[slot].used) {
+						if (ab_table[slot].a == a &&
+						    ab_table[slot].b == b) {
+							ab_table[slot].save_idx =
+								save_idx;
+							convert[ab_table[slot].purge_idx].rel_idx =
+								save_idx;
+							break;
+						}
+						slot = (slot + 1) &
+							(ab_capacity - 1);
+					}
+				}
+			}
+		}
+		savefile_read_line(buf, sizeof(buf), savefile);
+	}
+
+	savefile_close(savefile);
+	savefile_free(savefile);
+
+	for (i = 0; i < num_unique_relidx; i++) {
+		if (convert[i].rel_idx == UINT32_MAX) {
+			logprintf(obj,
+				"error: cannot locate purge relation "
+				"%u in savefile\n", i);
+			exit(-1);
+		}
+	}
+	free(ab_table);
 
 	for (i = 0; i < num_cycles; i++) {
 		la_col_t *c = cycle_list + i;
 
 		for (j = 0; j < c->cycle.num_relations; j++) {
-
 			relconvert_t *t = (relconvert_t *)bsearch(
 						c->cycle.list + j,
 						convert,
@@ -863,15 +1272,12 @@ void nfs_convert_cado_cycles(msieve_obj *obj) {
 						sizeof(relconvert_t),
 						bsearch_relconvert);
 			if (t == NULL) {
-				/* this cycle is corrupt somehow */
 				logprintf(obj, "error: cannot locate "
-						"relation %u\n", 
+						"relation %u\n",
 						c->cycle.list[j]);
 				exit(-1);
 			}
-			else {
-				c->cycle.list[j] = t->rel_idx;
-			}
+			c->cycle.list[j] = t->rel_idx;
 		}
 	}
 
@@ -879,4 +1285,3 @@ void nfs_convert_cado_cycles(msieve_obj *obj) {
 	free_cycle_list(cycle_list, num_cycles);
 	free(convert);
 }
-

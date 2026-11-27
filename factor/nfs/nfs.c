@@ -18,9 +18,12 @@ benefit from your work.
 #include "gmp_xface.h"
 #include <signal.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <string.h>
 #include "ytools.h"
 #include "threadpool.h"
 #include <math.h>
+#include <sys/stat.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -187,6 +190,48 @@ void checkFilePresence(char* name) {
 	fclose(fp);
 }
 
+static void copy_file(const char *source, const char *destination) {
+	FILE *src = fopen(source, "rb");
+	FILE *dst;
+	char buffer[65536];
+	size_t bytes;
+
+	if (src == NULL) {
+		printf("nfs: unable to open %s: %s\n", source, strerror(errno));
+		exit(-1);
+	}
+	dst = fopen(destination, "wb");
+	if (dst == NULL) {
+		printf("nfs: unable to open %s: %s\n", destination,
+				strerror(errno));
+		fclose(src);
+		exit(-1);
+	}
+
+	while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+		if (fwrite(buffer, 1, bytes, dst) != bytes) {
+			printf("nfs: unable to write %s\n", destination);
+			fclose(src);
+			fclose(dst);
+			exit(-1);
+		}
+	}
+	if (ferror(src)) {
+		printf("nfs: unable to read %s\n", source);
+		fclose(src);
+		fclose(dst);
+		exit(-1);
+	}
+	{
+		int src_status = fclose(src);
+		int dst_status = fclose(dst);
+		if (src_status != 0 || dst_status != 0) {
+			printf("nfs: error closing replay cycle file\n");
+			exit(-1);
+		}
+	}
+}
+
 //----------------------- NFS ENTRY POINT ------------------------------------//
 static void nfs_run(fact_obj_t *fobj);
 
@@ -210,7 +255,7 @@ static void nfs_run(fact_obj_t *fobj)
 	// expect the input in fobj->nfs_obj.gmp_n
 	char *input;
 	msieve_obj *obj = NULL;
-	char *nfs_args = NULL; // unused as yet
+	char *nfs_args = NULL;
 	UNUSED_VAR enum cpu_type cpu = ytools_get_cpu_type();
 	mp_t mpN;
 	factor_list_t factor_list;
@@ -227,8 +272,10 @@ static void nfs_run(fact_obj_t *fobj)
 	double t_time;
 	uint32_t pre_batch_rels = 0;
 	char tmpstr[GSTR_MAXSIZE];
+	char cado_savefile[GSTR_MAXSIZE] = "";
 	int process_done;
 	enum nfs_state_e nfs_state;
+	int initial_cado = 1;
 
 	// clear the job
 	memset(&job, 0, sizeof(nfs_job_t));
@@ -301,7 +348,7 @@ static void nfs_run(fact_obj_t *fobj)
                 (uint32_t)fobj->THREADS, (uint32_t)0, nfs_args);
 			fobj->nfs_obj.mobj = obj;
 
-			if (fobj->nfs_obj.cadoMsieve) {
+			if (fobj->nfs_obj.snfs == 0 && fobj->nfs_obj.cadoMsieve) {
 				nfs_state = NFS_STATE_CADO;
 				break;
 			}
@@ -316,6 +363,7 @@ static void nfs_run(fact_obj_t *fobj)
 			if (fobj->nfs_obj.cadoMsieve) {
 				// CADO-NFS takes care of resuming progress
 				nfs_state = NFS_STATE_POLY;
+				break;
 			} else {
 				// determine what to do next based on the state of various files.
 				// this will set job.current_rels if it finds any
@@ -721,196 +769,272 @@ static void nfs_run(fact_obj_t *fobj)
 			exit(-1);
 #endif
 
+			char cado_root[GSTR_MAXSIZE];
+			char cado_script[GSTR_MAXSIZE];
+			char cado_replay[GSTR_MAXSIZE];
+			char workdir[4097];
+			char cwdBuf[4097];
+			char hostname[256];
+			char cado_prefix[GSTR_MAXSIZE];
+			char cado_poly[GSTR_MAXSIZE];
+			char cado_purged[GSTR_MAXSIZE];
+			char cado_history[GSTR_MAXSIZE];
+			char cado_index[GSTR_MAXSIZE];
+			char cado_cycle[GSTR_MAXSIZE];
+			char replay_cycle[GSTR_MAXSIZE];
+			char syscmd[8192];
 			char buffer[1024];
+			struct stat purge_stat;
+			struct stat prefix_stat;
+			int nrclients;
+			int n;
 
 			if (job.snfs != NULL) {
-				// Select param file based on converted difficulty
 				cadoPower = est_gnfs_size(&job);
 				cadoPower -= cadoPower % 5;
 			}
 
-			FILE *dat = fopen("nfs.dat", "a+");
+			n = snprintf(cado_root, sizeof(cado_root), "%s",
+					fobj->nfs_obj.cado_dir);
+			if (n < 0 || (size_t)n >= sizeof(cado_root)) {
+				printf("nfs: CADO directory path is too long\n");
+				exit(-1);
+			}
+			while (n > 1 && cado_root[n - 1] == '/')
+				cado_root[--n] = '\0';
 
-			// First run
-			if (job.current_rels == 0) {
-				if (fgetc(dat) == 'N') {
-					// https://www.geeksforgeeks.org/c-program-count-number-lines-file/
-					for (char c = (char)fgetc(dat); !feof(dat); c = (char)fgetc(dat)) {
-						if (c == '\n') {
-							job.current_rels++;
-						}
-					}
+			if (snprintf(cado_script, sizeof(cado_script),
+					"%s/cado-nfs.py", cado_root) >=
+							(int)sizeof(cado_script) ||
+			    snprintf(cado_prefix, sizeof(cado_prefix),
+					"cadoWorkdir/c%d", cadoPower) >=
+							(int)sizeof(cado_prefix) ||
+			    snprintf(cado_poly, sizeof(cado_poly), "%s.poly",
+					cado_prefix) >= (int)sizeof(cado_poly) ||
+			    snprintf(cado_purged, sizeof(cado_purged),
+					"%s.purged", cado_prefix) >=
+							(int)sizeof(cado_purged) ||
+			    snprintf(cado_history, sizeof(cado_history),
+					"%s.history", cado_prefix) >=
+							(int)sizeof(cado_history) ||
+			    snprintf(cado_index, sizeof(cado_index), "%s.index",
+					cado_prefix) >= (int)sizeof(cado_index) ||
+			    snprintf(cado_savefile, sizeof(cado_savefile), "%s",
+					cado_prefix) >= (int)sizeof(cado_savefile) ||
+			    snprintf(cado_cycle, sizeof(cado_cycle), "%s.cyc",
+					cado_prefix) >= (int)sizeof(cado_cycle) ||
+			    snprintf(replay_cycle, sizeof(replay_cycle), "%s.cyc",
+					fobj->nfs_obj.outputfile) >=
+							(int)sizeof(replay_cycle)) {
+				printf("nfs: CADO output path is too long\n");
+				exit(-1);
+			}
+			if (getcwd(cwdBuf, sizeof(cwdBuf)) == NULL ||
+			    gethostname(hostname, sizeof(hostname)) != 0) {
+				printf("nfs: unable to determine CADO work paths\n");
+				exit(-1);
+			}
+			hostname[sizeof(hostname) - 1] = '\0';
+			if (snprintf(workdir, sizeof(workdir),
+					"%s/cadoWorkdir", cwdBuf) >=
+							(int)sizeof(workdir) ||
+			    snprintf(cado_replay, sizeof(cado_replay),
+					"%s/build/%s/filter/replay", cado_root,
+					hostname) >= (int)sizeof(cado_replay)) {
+				printf("nfs: CADO work path is too long\n");
+				exit(-1);
+			}
 
-					// Don't count the header
-					job.current_rels--;
+			checkFilePresence(cado_script);
+			checkFilePresence(fobj->nfs_obj.convert_poly_path);
+			checkFilePresence(cado_replay);
 
-					if (job.current_rels > job.min_rels) {
-						// Immediately try to filter again
-						job.min_rels = job.current_rels;
-					}
-
-					printf("nfs: found %d relations in nfs.dat\n", job.current_rels);
-				} else {
-					// Write the N header
-					sprintf(buffer, "N %s\n", input);
-					fwrite(buffer, sizeof(char), strlen(buffer), dat);
-					printf("nfs: created nfs.dat\n");
+			nrclients = (int)(((uint32_t)fobj->num_threads / 2u) +
+						((uint32_t)fobj->num_threads % 2u));
+			n = snprintf(syscmd, sizeof(syscmd),
+					"\"%s\" \"%s/parameters/factor/params.c%d\" "
+					"N=%s slaves.nrclients=%d "
+					"slaves.hostnames=localhost tasks.gzip=0 "
+					"tasks.filter.merge.skip=0 "
+					"tasks.linalg.run=false "
+					"slaves.downloadretry=1 ",
+					cado_script, cado_root, cadoPower, input,
+					nrclients);
+			if (n < 0 || (size_t)n >= sizeof(syscmd)) {
+				printf("nfs: CADO command is too long\n");
+				exit(-1);
+			}
+			if (!initial_cado && job.min_rels != 0) {
+				size_t command_len = strlen(syscmd);
+				n = snprintf(syscmd + command_len,
+						sizeof(syscmd) - command_len,
+						"tasks.sieve.rels_wanted=%u ",
+						(unsigned int)job.min_rels);
+				if (n < 0 || (size_t)n >=
+						sizeof(syscmd) - command_len) {
+					printf("nfs: CADO command is too long\n");
+					exit(-1);
 				}
+				initial_cado = 0;
 			}
 
-			// Check for cado-nfs.py presence
-			sprintf(buffer, "%scado-nfs.py", fobj->nfs_obj.cado_dir);
-			checkFilePresence(buffer);
-
-			printf("nfs: calling cado-nfs\n");
-			char syscmd[8192];
-
-			// Specify path, param file and N
-			sprintf(syscmd, "%s %sparameters/factor/params.c%d N=%s ", buffer, fobj->nfs_obj.cado_dir, cadoPower, input);
-
-			// Roundup of fobj->num_threads / 2
-			int nrclients = (int)((uint32_t)(fobj->num_threads / 2) + (fobj->num_threads % 2));
-			// Spawn clients based on fobj->num_threads
-			// Use sprintf to append to end of syscmd
-			sprintf(syscmd + strlen(syscmd), "slaves.nrclients=%d slaves.hostnames=localhost ", nrclients);
-
-			// Stop after sieving enough relations
-			sprintf(syscmd + strlen(syscmd), "tasks.filter.run=false ");
-
-			// Reduce time before retry from 10 seconds to 1 second
-			sprintf(syscmd + strlen(syscmd), "slaves.downloadretry=1 ");
-
-			if (job.min_rels != 0) {
-				// Specify relations wanted
-				sprintf(syscmd + strlen(syscmd), "tasks.sieve.rels_wanted=%d ", job.min_rels);
-			}
-
-			// SNFS, hell yeah!
-			// Information source: https://www.mersenneforum.org/showthread.php?t=24842
 			if (job.snfs != NULL) {
-				// Create poly file
 				FILE *poly = fopen("nfs.poly", "w");
-
-				sprintf(buffer, "n: %s\n", input);
-				sprintf(buffer + strlen(buffer), "skew: %f\n", job.snfs->poly->skew);
-
+				size_t used = 0;
+				if (poly == NULL) {
+					printf("nfs: unable to create nfs.poly\n");
+					exit(-1);
+				}
+				n = snprintf(buffer, sizeof(buffer),
+						"n: %s\nskew: %f\n", input,
+						job.snfs->poly->skew);
+				if (n < 0 || (size_t)n >= sizeof(buffer)) {
+					fclose(poly);
+					printf("nfs: SNFS polynomial is too large\n");
+					exit(-1);
+				}
+				used = (size_t)n;
 				for (int deg = MAX_POLY_DEGREE; deg >= 0; deg--) {
 					s = mpz_get_str(NULL, 10, job.snfs->c[deg]);
-					sprintf(buffer + strlen(buffer), "c%d: %s\n", deg, s);
+					n = snprintf(buffer + used, sizeof(buffer) - used,
+							"c%d: %s\n", deg, s);
 					free(s);
+					if (n < 0 || (size_t)n >= sizeof(buffer) - used) {
+						fclose(poly);
+						printf("nfs: SNFS polynomial is too large\n");
+						exit(-1);
+					}
+					used += (size_t)n;
 				}
-
 				for (int deg = 1; deg >= 0; deg--) {
-					s = mpz_get_str(NULL, 10, job.snfs->poly->rat.coeff[deg]);
-					sprintf(buffer + strlen(buffer), "Y%d: %s\n", deg, s);
+					s = mpz_get_str(NULL, 10,
+							job.snfs->poly->rat.coeff[deg]);
+					n = snprintf(buffer + used, sizeof(buffer) - used,
+							"Y%d: %s\n", deg, s);
 					free(s);
+					if (n < 0 || (size_t)n >= sizeof(buffer) - used) {
+						fclose(poly);
+						printf("nfs: SNFS polynomial is too large\n");
+						exit(-1);
+					}
+					used += (size_t)n;
 				}
-
-				fwrite(buffer, sizeof(char), strlen(buffer), poly);
-				fclose(poly);
-
-				// Make CADO use our poly
-				sprintf(syscmd + strlen(syscmd), "tasks.polyselect.import=nfs.poly ");
-
-				int sqside;
-				if (job.snfs->poly->side == RATIONAL_SPQ) {
-					sqside = 0;
-				} else {
-					sqside = 1;
+				{
+					size_t written = fwrite(buffer, 1, used, poly);
+					int close_status = fclose(poly);
+					if (written != used || close_status != 0) {
+						printf("nfs: unable to write nfs.poly\n");
+						exit(-1);
+					}
 				}
-
-				// Specify whether to sieve rational or algebraic side
-				sprintf(syscmd + strlen(syscmd), "tasks.sieve.sqside=%d ", sqside);
-
-				// CADO seems to know the right sieving parameters, so we ignore the params from nfs.job
-				/*
-				// Specify sieving parameters
-				// Apparently 0=r, 1=a
-				sprintf(syscmd + strlen(syscmd), "tasks.lim0=%d tasks.lim1=%d ", job.rlim, job.alim);
-				sprintf(syscmd + strlen(syscmd), "tasks.lpb0=%d tasks.lpb1=%d ", job.lpbr, job.lpba);
-				sprintf(syscmd + strlen(syscmd), "tasks.sieve.mfb0=%d tasks.sieve.mfb1=%d ", job.mfbr, job.mfba);
-				sprintf(syscmd + strlen(syscmd), "tasks.sieve.lambda0=%f tasks.sieve.lambda1=%f ", job.rlambda, job.alambda);
-				*/
+				{
+					size_t command_len = strlen(syscmd);
+					n = snprintf(syscmd + command_len,
+						sizeof(syscmd) - command_len,
+						"tasks.polyselect.import=nfs.poly "
+						"tasks.sieve.sqside=%d ",
+						job.snfs->poly->side == RATIONAL_SPQ ? 0 : 1);
+					if (n < 0 || (size_t)n >=
+							sizeof(syscmd) - command_len) {
+						printf("nfs: CADO command is too long\n");
+						exit(-1);
+					}
+				}
 			}
 
-			// Specify work directory as an absolute path
-			char cwdBuf[4097];
-#ifdef _MSC_VER
-			_getcwd(cwdBuf, 4097);
-#else
-			if (getcwd(cwdBuf, 4097) == NULL) cwdBuf[0] = '\0';
-#endif
-			sprintf(syscmd + strlen(syscmd), "-w %s/cadoWorkdir", cwdBuf);
+			{
+				size_t command_len = strlen(syscmd);
+				n = snprintf(syscmd + command_len,
+						sizeof(syscmd) - command_len,
+						"-w \"%s\"", workdir);
+				if (n < 0 || (size_t)n >=
+						sizeof(syscmd) - command_len) {
+					printf("nfs: CADO command is too long\n");
+					exit(-1);
+				}
+			}
 
+			printf("nfs: calling cado-nfs through merge, before replay\n");
 			printf("nfs: cmdline: %s\n", syscmd);
-			if (system(syscmd) != 0) { /* failure shows up when the output is checked */ }
+			if (system(syscmd) != 0) {
+				printf("nfs: cado-nfs failed\n");
+				exit(-1);
+			}
 
-			// Check for convert_poly presence
-			checkFilePresence(fobj->nfs_obj.convert_poly_path);
+			checkFilePresence(cado_poly);
+			checkFilePresence(cado_purged);
+			checkFilePresence(cado_history);
+			checkFilePresence(cado_index);
 
-			// Ensure CADO did find the poly
-			sprintf(buffer, "./cadoWorkdir/c%d.poly", cadoPower);
-			checkFilePresence(buffer);
+			n = snprintf(syscmd, sizeof(syscmd),
+					"\"%s\" -of msieve < \"%s\" > \"%s\"",
+					fobj->nfs_obj.convert_poly_path, cado_poly,
+					fobj->nfs_obj.fbfile);
+			if (n < 0 || (size_t)n >= sizeof(syscmd)) {
+				printf("nfs: convert_poly command is too long\n");
+				exit(-1);
+			}
+			printf("nfs: converting CADO polynomial for Msieve\n");
+			if (system(syscmd) != 0) {
+				printf("nfs: convert_poly failed\n");
+				exit(-1);
+			}
+			checkFilePresence(fobj->nfs_obj.fbfile);
 
-			printf("nfs: calling convert_poly to create nfs.fb from c*.poly\n");
-			// TODO: Support Windows lol
-			sprintf(syscmd, "%s -of msieve < ./cadoWorkdir/c%d.poly > nfs.fb", fobj->nfs_obj.convert_poly_path, cadoPower);
-			if (system(syscmd) != 0) { /* failure shows up when the output is checked */ }
+			n = snprintf(syscmd, sizeof(syscmd),
+					"\"%s\" -purged \"%s\" -his \"%s\" "
+					"-index \"%s\" -out \"%s\" "
+					"-for_msieve -skip 0",
+					cado_replay, cado_purged, cado_history,
+					cado_index, replay_cycle);
+			if (n < 0 || (size_t)n >= sizeof(syscmd)) {
+				printf("nfs: CADO replay command is too long\n");
+				exit(-1);
+			}
+			printf("nfs: replaying CADO filtering output for Msieve\n");
+			if (system(syscmd) != 0) {
+				printf("nfs: CADO replay failed\n");
+				exit(-1);
+			}
+			checkFilePresence(replay_cycle);
+			copy_file(replay_cycle, cado_cycle);
+			char *purged_absolute_path = realpath(cado_purged, NULL);
 
-			printf("nfs: appending CADO relations into nfs.dat\n");
-
-			// By default, there are no cross-platform way of listing all files under a directory, so we have to find filenames through the log file
-			sprintf(buffer, "cadoWorkdir/c%d.log", cadoPower);
-			FILE *logFile = fopen(buffer, "r");
-			checkFp(logFile, buffer);
-
-			char logLine[3072];
-			while (fgets(logLine, 3072, logFile)) {
-				// Check if this logLine has relation filename
-				char *match = " relations in '";
-				char *filename = strstr(logLine, match);
-				if (filename == NULL) continue;
-
-				// Move beyond " relations in '" text
-				filename += strlen(match);
-				// Read ptr until next ' character
-				strtok(filename, "'");
-
-				// filename is now something like "/home/nyancat/Tools/yafu-combined/cadoWorkdir/c85.upload/c85.146453-147000.s_yzjb7c.gz"
-				// printf("Extracting %s\n", filename);
-
-				// Extract the relations into nfs.cado
-				// Don't keep the file, as that would cause us to read it again the next run
-				// Suppress stderr with 2>/dev/null
-				sprintf(syscmd, "gunzip -c %s 1>nfs.cado 2>/dev/null && rm %s", filename, filename);
-				if (system(syscmd) != 0) { /* failure shows up when the output is checked */ }
-				checkFilePresence("nfs.cado");
-
-				// Read the relations
-				FILE *relatFile = fopen("nfs.cado", "r");
-				checkFp(relatFile, "nfs.cado");
-
-				char relatLine[1024];
-				while (fgets(relatLine, 1024, relatFile)) {
-					// Is this line a comment?
-					if (relatLine[0] == '#') continue;
-
-					// fgets include \n already
-					fwrite(relatLine, sizeof(char), strlen(relatLine), dat);
-					job.current_rels++;
+			if (lstat(cado_savefile, &prefix_stat) == 0) {
+				if (stat(cado_savefile, &prefix_stat) != 0 ||
+				    stat(cado_purged, &purge_stat) != 0 ||
+				    prefix_stat.st_dev != purge_stat.st_dev ||
+				    prefix_stat.st_ino != purge_stat.st_ino) {
+					printf("nfs: CADO savefile path already exists "
+						"and is not the purged file: %s\n",
+						cado_savefile);
+					exit(-1);
 				}
-				fclose(relatFile);
 			}
-			fclose(logFile);
-			fclose(dat);
-
-			// min_rels is not set by YAFU during GNFS
-			if (job.min_rels == 0) {
-				job.min_rels = job.current_rels;
+			else if (errno != ENOENT || symlink(purged_absolute_path,
+								cado_savefile) != 0) {
+				printf("nfs: unable to link CADO purge file as "
+					"Msieve savefile: %s\n", purged_absolute_path);
+				exit(-1);
 			}
+			free(purged_absolute_path);
 
-			printf("nfs: now have %d relations\n", job.current_rels);
-			nfs_state = NFS_STATE_FILTER;
+			flags = MSIEVE_FLAG_USE_LOGFILE |
+					MSIEVE_FLAG_NFS_LA |
+					MSIEVE_FLAG_NFS_SQRT;
+			if (fobj->VFLAG > 0)
+				flags |= MSIEVE_FLAG_LOG_TO_STDOUT;
+			nfs_args = "cado_filter=1";
+			msieve_obj_free(obj);
+			obj = msieve_obj_new(input, flags, cado_savefile,
+					fobj->nfs_obj.logfile, fobj->nfs_obj.fbfile,
+					fobj->seed1, fobj->seed2, (uint32_t)0, 9,
+					(uint32_t)fobj->L1CACHE,
+					(uint32_t)fobj->L2CACHE,
+					(uint32_t)fobj->THREADS, (uint32_t)0,
+					nfs_args);
+			fobj->nfs_obj.mobj = obj;
+			nfs_state = NFS_STATE_LINALG;
 			break;
 		}
 
@@ -973,6 +1097,8 @@ static void nfs_run(fact_obj_t *fobj)
 				if (fobj->VFLAG > 0)
 					flags = flags | MSIEVE_FLAG_LOG_TO_STDOUT;
 				flags = flags | MSIEVE_FLAG_NFS_LA;
+				if (fobj->nfs_obj.cadoMsieve)
+					flags |= MSIEVE_FLAG_NFS_SQRT;
 
 				// add restart flag if requested
 				if (fobj->nfs_obj.nfs_phases & NFS_PHASE_LA_RESUME)
@@ -989,10 +1115,14 @@ static void nfs_run(fact_obj_t *fobj)
 				if (fobj->LATHREADS > 0)
 				{
 					msieve_obj_free(obj);
-					obj = msieve_obj_new(input, flags, fobj->nfs_obj.outputfile, fobj->nfs_obj.logfile,
+					obj = msieve_obj_new(input, flags,
+						fobj->nfs_obj.cadoMsieve ?
+							cado_savefile : fobj->nfs_obj.outputfile,
+						fobj->nfs_obj.logfile,
 						fobj->nfs_obj.fbfile, fobj->seed1, fobj->seed2, (uint32_t)0, 9,
 						(uint32_t)fobj->L1CACHE, (uint32_t)fobj->L2CACHE,
                         (uint32_t)fobj->LATHREADS, (uint32_t)0, nfs_args);
+					fobj->nfs_obj.mobj = obj;
 				}
 
 				// try this hack - store a pointer to the msieve obj so that
@@ -1015,10 +1145,16 @@ static void nfs_run(fact_obj_t *fobj)
 					// dependencies were found.  try again from filtering with
 					// 20% less relations.
 					FILE *t;
-					sprintf(tmpstr, "%s.dep", fobj->nfs_obj.outputfile);
+					sprintf(tmpstr, "%s.dep", obj->savefile.name);
 					if ((t = fopen(tmpstr, "r")) == NULL)
 					{
-						if (job.use_max_rels > 0)
+						if (fobj->nfs_obj.cadoMsieve)
+						{
+							printf("nfs: CADO replay produced no dependency file\n");
+							fobj->flags |= FACTOR_INTERRUPT;
+							nfs_state = NFS_STATE_DONE;
+						}
+						else if (job.use_max_rels > 0)
 						{
 							// we've already tried again with an attempted fix to the trivial
 							// dependencies problem, so either that wasn't the problem or
@@ -1056,10 +1192,14 @@ static void nfs_run(fact_obj_t *fobj)
 				if (fobj->LATHREADS > 0)
 				{
 					msieve_obj_free(obj);
-					obj = msieve_obj_new(input, flags, fobj->nfs_obj.outputfile, fobj->nfs_obj.logfile,
+					obj = msieve_obj_new(input, flags,
+						fobj->nfs_obj.cadoMsieve ?
+							cado_savefile : fobj->nfs_obj.outputfile,
+						fobj->nfs_obj.logfile,
 						fobj->nfs_obj.fbfile, fobj->seed1, fobj->seed2, (uint32_t)0, 9,
 						(uint32_t)fobj->L1CACHE, (uint32_t)fobj->L2CACHE, 
                         (uint32_t)fobj->THREADS, (uint32_t)0, nfs_args);
+					fobj->nfs_obj.mobj = obj;
 				}
 
 				obj_ptr = NULL;
@@ -3001,4 +3141,3 @@ void nfs(fact_obj_t *fobj)
 }
 
 #endif
-
